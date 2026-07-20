@@ -272,7 +272,60 @@ $cfg['st_stream_cache'] = ($settings['st_stream_cache'] ?? '1') === '1'; // ال
 
 
 // هل الزائر الحالي مدير مسجّل الدخول؟ (لتجاوز الصيانة والقفل)
+/* [إصلاح] كانت هذه السطر تقرأ $_SESSION قبل بدء الجلسة، فتكون فارغة دائماً
+   ولا يُتعرَّف على المدير إطلاقاً. نبدأ الجلسة أولاً. */
+if (session_status() !== PHP_SESSION_ACTIVE) { @session_start(); }
 $__is_admin_visitor = !empty($_SESSION['admin_logged_in']) || !empty($_SESSION['admin_username']) || !empty($_SESSION['is_admin']);
+
+/* ══ [أمان] وكيل TMDB من جهة الخادم ══
+   كان مفتاح TMDB يُطبع داخل شيفرة الصفحة، فيقرأه أي زائر من مصدر الصفحة
+   ويستعمله باسم المالك. الآن يبقى المفتاح على الخادم، والمتصفح يسأل هذه
+   النقطة فقط. تُنفَّذ قبل أي إخراج HTML. */
+if (isset($_GET['tmdb_proxy'])) {
+    while (ob_get_level()) ob_end_clean();
+    header('Content-Type: application/json; charset=utf-8');
+    header('Cache-Control: no-store');
+
+    $__tmdb_key = trim($settings['tmdb_api_key'] ?? '');
+    if ($__tmdb_key === '') { echo json_encode(['error' => 'disabled']); exit; }
+
+    // مسارات مسموحة فقط — لا نسمح للمتصفح بتمرير مسار حر
+    $__mode = $_GET['tmdb_proxy'];
+    $__lang = (($_GET['lang'] ?? 'ar') === 'en') ? 'en-US' : 'ar';
+
+    if ($__mode === 'search') {
+        $__q = trim((string)($_GET['q'] ?? ''));
+        if ($__q === '' || mb_strlen($__q) > 200) { echo json_encode(['results' => []]); exit; }
+        $__url = 'https://api.themoviedb.org/3/search/multi?api_key=' . urlencode($__tmdb_key)
+               . '&query=' . urlencode($__q) . '&language=' . urlencode($__lang);
+    } elseif ($__mode === 'detail') {
+        $__type = ($_GET['type'] ?? '') === 'movie' ? 'movie' : 'tv';
+        $__id   = (int)($_GET['id'] ?? 0);
+        if ($__id <= 0) { echo json_encode(['error' => 'bad id']); exit; }
+        $__url = 'https://api.themoviedb.org/3/' . $__type . '/' . $__id
+               . '?api_key=' . urlencode($__tmdb_key) . '&language=' . urlencode($__lang);
+    } else {
+        echo json_encode(['error' => 'bad mode']); exit;
+    }
+
+    $__ch = curl_init($__url);
+    curl_setopt_array($__ch, [
+        CURLOPT_RETURNTRANSFER => true,
+        CURLOPT_TIMEOUT        => 12,
+        CURLOPT_FOLLOWLOCATION => false,
+        CURLOPT_USERAGENT      => 'ShashetyIPTV',
+    ]);
+    $__res  = curl_exec($__ch);
+    $__code = (int)curl_getinfo($__ch, CURLINFO_HTTP_CODE);
+    curl_close($__ch);
+
+    if ($__res === false) { echo json_encode(['error' => 'network']); exit; }
+    // لا نمرّر أخطاء TMDB الخام (قد تحوي المفتاح في رسالة الخطأ)
+    if ($__code === 401) { echo json_encode(['error' => 'bad key']); exit; }
+    if ($__code !== 200) { echo json_encode(['error' => 'upstream']); exit; }
+    echo $__res;
+    exit;
+}
 
 /* ── إجبار HTTPS: إعادة توجيه أي http إلى https ── */
 if ($gs_force_https && empty($_SERVER['HTTPS']) && ($_SERVER['HTTP_X_FORWARDED_PROTO'] ?? '') !== 'https' && PHP_SAPI !== 'cli') {
@@ -1406,7 +1459,12 @@ a,button,.netflix-card,.nx-card,[onclick]{touch-action:manipulation}
 <?php if ($gs_announce_enabled && trim($gs_announce_text) !== ''): ?>
 <div id="gsAnnounceBar" style="position:relative;z-index:9998;background:linear-gradient(90deg,var(--accent,#e50914),#9a050d);color:#fff;text-align:center;padding:9px 40px;font-size:.9rem;font-weight:600;box-shadow:0 2px 10px rgba(0,0,0,.4)">
   <?php if (trim($gs_announce_link) !== ''): ?>
-    <a href="<?php echo htmlspecialchars($gs_announce_link); ?>" target="_blank" rel="noopener" style="color:#fff;text-decoration:none"><?php echo htmlspecialchars($gs_announce_text); ?></a>
+    <?php
+      /* [أمان] نسمح فقط بـ http/https أو رابط نسبي — نمنع javascript: و data: */
+      $__al = trim($gs_announce_link);
+      if (!preg_match('#^(https?://|/)#i', $__al)) { $__al = 'https://' . ltrim($__al, '/'); }
+    ?>
+    <a href="<?php echo htmlspecialchars($__al, ENT_QUOTES); ?>" target="_blank" rel="noopener noreferrer" style="color:#fff;text-decoration:none"><?php echo htmlspecialchars($gs_announce_text); ?></a>
   <?php else: ?>
     <?php echo htmlspecialchars($gs_announce_text); ?>
   <?php endif; ?>
@@ -2249,26 +2307,33 @@ function toast(msg){
 }
 
 /* ════ TMDB ════ */
-function getTmdbKey(){const sk="<?php echo htmlspecialchars($settings['tmdb_api_key']??''); ?>";if(sk.trim())return sk.trim();return localStorage.getItem('tmdb_api_key')||null;}
+/* [أمان] المفتاح لم يعد يصل للمتصفح إطلاقاً — كل الطلبات عبر وكيل الخادم. */
 async function showTmdbInfoClient(query,defaultType){
-  const key=getTmdbKey();const modal=document.getElementById('tmdbInfoM');const body=document.getElementById('tmdbInfoBody');
+  const modal=document.getElementById('tmdbInfoM');const body=document.getElementById('tmdbInfoBody');
   modal.classList.add('open');document.body.style.overflow='hidden';
-  if(!key){body.innerHTML='<div style="text-align:center;padding:40px;color:var(--text-muted)">ميزة التفاصيل غير مفعلة</div>';return;}
   body.innerHTML='<div style="text-align:center;padding:40px;color:var(--text-muted)">جاري الجلب...</div>';
   try{
     const cq=query.replace(/(1080p|720p|4k|fhd|hd|ar|en)/gi,'').trim();
-    const sr=await fetch(`https://api.themoviedb.org/3/search/multi?api_key=${key}&query=${encodeURIComponent(cq)}&language=ar`);
-    if(sr.status===401){body.innerHTML='<div style="text-align:center;padding:40px;color:#ff4d57">مفتاح API غير صحيح</div>';return;}
-    const sd=await sr.json();
+    const sd=await(await fetch(`index.php?tmdb_proxy=search&q=${encodeURIComponent(cq)}`)).json();
+    if(sd.error==='disabled'){body.innerHTML='<div style="text-align:center;padding:40px;color:var(--text-muted)">ميزة التفاصيل غير مفعلة</div>';return;}
+    if(sd.error==='bad key'){body.innerHTML='<div style="text-align:center;padding:40px;color:#ff4d57">مفتاح API غير صحيح</div>';return;}
     if(!sd.results||!sd.results.length){body.innerHTML='<div style="text-align:center;padding:40px;color:var(--text-muted)">لم يتم العثور على معلومات</div>';return;}
     const item=sd.results.find(i=>i.media_type==='movie'||i.media_type==='tv')||sd.results[0];
-    const type=item.media_type||defaultType;
-    let d=await(await fetch(`https://api.themoviedb.org/3/${type}/${item.id}?api_key=${key}&language=ar`)).json();
-    if(!d.overview){const en=await(await fetch(`https://api.themoviedb.org/3/${type}/${item.id}?api_key=${key}&language=en-US`)).json();d.overview=en.overview;}
-    const title=d.title||d.name||cq;const poster=d.poster_path?`https://image.tmdb.org/t/p/w300${d.poster_path}`:'';
-    const year=(d.release_date||d.first_air_date||'').substring(0,4);const rating=d.vote_average?d.vote_average.toFixed(1):'—';
-    const genres=(d.genres||[]).map(g=>`<span class="tmdb-genre-badge">${g.name}</span>`).join(' ');
-    body.innerHTML=`<div class="tmdb-info-wrap">${poster?`<img src="${poster}" class="tmdb-info-poster">`:''}<div class="tmdb-info-details"><div class="tmdb-info-title">${title} ${year?'('+year+')':''}</div><div class="tmdb-info-meta"><span style="color:#f5c518;font-weight:bold">★ ${rating}</span></div><div style="margin-bottom:12px">${genres}</div><div class="tmdb-info-overview">${d.overview||'لا توجد قصة متوفرة'}</div></div></div>`;
+    const type=(item.media_type||defaultType)==='movie'?'movie':'tv';
+    let d=await(await fetch(`index.php?tmdb_proxy=detail&type=${type}&id=${encodeURIComponent(item.id)}`)).json();
+    if(!d.overview){
+      const en=await(await fetch(`index.php?tmdb_proxy=detail&type=${type}&id=${encodeURIComponent(item.id)}&lang=en`)).json();
+      d.overview=en.overview;
+    }
+    const title=d.title||d.name||cq;
+    /* [أمان] بيانات TMDB خارجية — تُهرَّب قبل الإدراج لمنع XSS.
+       poster_path يُبنى من رقم/مسار TMDB فقط، ونتحقق من شكله. */
+    const posterOk=typeof d.poster_path==='string'&&/^\/[A-Za-z0-9._-]+$/.test(d.poster_path);
+    const poster=posterOk?`https://image.tmdb.org/t/p/w300${d.poster_path}`:'';
+    const year=String(d.release_date||d.first_air_date||'').substring(0,4);
+    const rating=d.vote_average?Number(d.vote_average).toFixed(1):'—';
+    const genres=(d.genres||[]).map(g=>`<span class="tmdb-genre-badge">${esc(g.name)}</span>`).join(' ');
+    body.innerHTML=`<div class="tmdb-info-wrap">${poster?`<img src="${esc(poster)}" class="tmdb-info-poster">`:''}<div class="tmdb-info-details"><div class="tmdb-info-title">${esc(title)} ${year?'('+esc(year)+')':''}</div><div class="tmdb-info-meta"><span style="color:#f5c518;font-weight:bold">★ ${esc(rating)}</span></div><div style="margin-bottom:12px">${genres}</div><div class="tmdb-info-overview">${esc(d.overview||'لا توجد قصة متوفرة')}</div></div></div>`;
   }catch(e){body.innerHTML='<div style="text-align:center;padding:40px;color:#ff4d57">خطأ في الاتصال</div>';}
 }
 function closeTmdbModal(){document.getElementById('tmdbInfoM').classList.remove('open');document.body.style.overflow='';}
@@ -6031,8 +6096,33 @@ window.addEventListener('load',function(){
 
 <?php /* ═══ تصدير إعدادات المجموعات إلى JS + تطبيق فعلي على الواجهة والمشغّل ═══ */ ?>
 <script>
-/* كل إعدادات الموقع متاحة عالمياً في window.SITE_CFG (تُقرأ من قاعدة البيانات) */
-window.SITE_CFG = <?php echo json_encode($cfg, JSON_UNESCAPED_UNICODE); ?>;
+/* [أمان] لا نُصدّر كل $cfg إلى المتصفح — كان يكشف إعدادات الخادم لأي زائر.
+   نُصدّر فقط المفاتيح التي تحتاجها الواجهة فعلاً (قائمة بيضاء). */
+window.SITE_CFG = <?php
+$__cfg_public_keys = [
+    // الواجهة
+    'theme_color','ui_font','ui_font_size','ui_transitions','usr_dark_mode',
+    // المشغّل (سلوك مرئي فقط)
+    'pl_autoplay','pl_mute_on_start','pl_pip','pl_playback_speed','pl_auto_fullscreen',
+    'pl_show_channel_name','pl_show_channel_logo','pl_webcast','pl_show_clock',
+    'pl_seek_buttons','pl_show_viewers','pl_show_share','pl_show_report',
+    // الترجمة
+    'sub_font_size','sub_font_color','sub_bg_color','sub_bg_opacity',
+    // ميزات المستخدم
+    'usr_notifications','usr_favorites','usr_watch_history',
+    // الأفلام
+    'mv_play_trailer','mv_show_similar',
+    // إعدادات hls.js من جهة العميل فقط
+    'st_default_quality','st_low_latency','st_max_buffer','st_back_buffer',
+    'st_buffer_size','st_live_sync','st_auto_quality',
+    'st_reconnect_attempts','st_reconnect_timeout',
+];
+$__cfg_public = [];
+foreach ($__cfg_public_keys as $__k) {
+    if (array_key_exists($__k, $cfg)) $__cfg_public[$__k] = $cfg[$__k];
+}
+echo json_encode($__cfg_public, JSON_UNESCAPED_UNICODE | JSON_HEX_TAG | JSON_HEX_AMP | JSON_HEX_APOS | JSON_HEX_QUOT);
+?>;
 (function(){
   var C = window.SITE_CFG || {};
   // ── تطبيق إعدادات الواجهة (لون/خط/حجم الخط/الانتقالات/الخ) ──
